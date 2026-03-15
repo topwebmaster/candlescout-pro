@@ -1,0 +1,176 @@
+version: "3.9"
+
+services:
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg17
+    environment:
+      POSTGRES_DB:       ${DB_NAME:-candlescout}
+      POSTGRES_USER:     ${DB_USER:-candlescout}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-candlescout}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.4-alpine
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  django-migrate:
+    build:
+      context: .
+      dockerfile: django_app/Dockerfile
+    command: python manage.py migrate --no-input
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    env_file: .env
+    volumes:
+      - ./django_app:/app
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: fastapi_app/Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      django-migrate:
+        condition: service_completed_successfully
+    env_file: .env
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+    volumes:
+      - ./fastapi_app:/app
+      - ./tortoise_models:/tortoise_models
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: django_app/Dockerfile
+    command: celery -A celery_app worker -l info -c 4 -Q default,ml,reporting
+    depends_on:
+      - timescaledb
+      - redis
+    env_file: .env
+    volumes:
+      - ./django_app:/app
+      - models_data:/models
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: django_app/Dockerfile
+    command: celery -A celery_app beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    depends_on:
+      - timescaledb
+      - redis
+    env_file: .env
+
+  data-ingestion:
+    build:
+      context: .
+      dockerfile: services/data_ingestion/Dockerfile
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    restart: unless-stopped
+
+  analysis-pipeline:
+    build:
+      context: .
+      dockerfile: services/analysis_pipeline/Dockerfile
+    depends_on:
+      - timescaledb
+      - redis
+    env_file: .env
+    deploy:
+      replicas: 2
+    restart: unless-stopped
+
+  ml-service:
+    build:
+      context: .
+      dockerfile: services/ml_service/Dockerfile
+    depends_on:
+      - timescaledb
+    env_file: .env
+    volumes:
+      - models_data:/models
+    restart: unless-stopped
+
+  trade-executor:
+    build:
+      context: .
+      dockerfile: services/trade_executor/Dockerfile
+    depends_on:
+      - timescaledb
+      - redis
+    env_file: .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  signal-dispatcher:
+    build:
+      context: .
+      dockerfile: services/signal_dispatcher/Dockerfile
+    depends_on:
+      - redis
+    env_file: .env
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.0.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+
+volumes:
+  db_data:
+  redis_data:
+  models_data:
+  prometheus_data:
+  grafana_data:
