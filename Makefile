@@ -67,3 +67,66 @@ generate-fernet-key:
 
 generate-secret-key:
 	python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+
+# ── Database ──────────────────────────────────────────────────────
+db-shell:
+	docker compose exec timescaledb psql -U candlescout -d candlescout
+
+db-backup:
+	docker compose exec timescaledb pg_dump -U candlescout candlescout > backup_$$(date +%Y%m%d_%H%M%S).sql
+
+db-restore:
+	docker compose exec -T timescaledb psql -U candlescout -d candlescout < $(FILE)
+
+# ── Redis ─────────────────────────────────────────────────────────
+redis-cli:
+	docker compose exec redis redis-cli
+
+redis-flush:
+	docker compose exec redis redis-cli FLUSHALL
+
+redis-monitor:
+	docker compose exec redis redis-cli MONITOR
+
+# ── Services ──────────────────────────────────────────────────────
+start-data-ingestion:
+	docker compose up -d data-ingestion
+
+start-analysis:
+	docker compose up -d analysis-pipeline
+
+start-ml:
+	docker compose up -d ml-service
+
+start-dispatcher:
+	docker compose up -d signal-dispatcher
+
+start-executor:
+	docker compose up -d trade-executor
+
+start-position-manager:
+	docker compose up -d position-manager
+
+start-api:
+	docker compose up -d api-service
+
+# ── Monitoring ────────────────────────────────────────────────────
+start-monitoring:
+	docker compose up -d prometheus grafana
+
+open-grafana:
+	open http://localhost:3000 || xdg-open http://localhost:3000
+
+open-prometheus:
+	open http://localhost:9090 || xdg-open http://localhost:9090
+
+# ── Development ───────────────────────────────────────────────────
+dev-setup:
+	@echo "Setting up CandleScout Pro development environment..."
+	cp .env.example .env
+	@echo "✓ Created .env file"
+	@echo "✓ Edit .env with your API keys and configuration"
+	@echo "Run 'make up' to start all services"
+
+status:
+	docker compose ps

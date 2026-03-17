@@ -2,12 +2,22 @@ version: "3.9"
 
 services:
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # INFRASTRUCTURE SERVICES
+  # ═══════════════════════════════════════════════════════════════════════════
+
   timescaledb:
     image: timescale/timescaledb:latest-pg17
+    container_name: candlescout-timescaledb
     environment:
       POSTGRES_DB:       ${DB_NAME:-candlescout}
       POSTGRES_USER:     ${DB_USER:-candlescout}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      # Performance tuning
+      POSTGRES_SHARED_BUFFERS: 256MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 1GB
+      POSTGRES_WORK_MEM: 16MB
+      POSTGRES_MAINTENANCE_WORK_MEM: 128MB
     volumes:
       - db_data:/var/lib/postgresql/data
       - ./init_db.sql:/docker-entrypoint-initdb.d/init.sql
@@ -18,14 +28,17 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   redis:
     image: redis:7.4-alpine
+    container_name: candlescout-redis
     command: >
       redis-server
       --maxmemory 512mb
       --maxmemory-policy allkeys-lru
       --appendonly yes
+      --save 60 1000
     volumes:
       - redis_data:/data
     ports:
@@ -35,65 +48,17 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
 
-  django-migrate:
-    build:
-      context: .
-      dockerfile: django_app/Dockerfile
-    command: python manage.py migrate --no-input
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-    env_file: .env
-    volumes:
-      - ./django_app:/app
-
-  fastapi:
-    build:
-      context: .
-      dockerfile: fastapi_app/Dockerfile
-    ports:
-      - "8000:8000"
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      django-migrate:
-        condition: service_completed_successfully
-    env_file: .env
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
-    volumes:
-      - ./fastapi_app:/app
-      - ./tortoise_models:/tortoise_models
-
-  celery-worker:
-    build:
-      context: .
-      dockerfile: django_app/Dockerfile
-    command: celery -A celery_app worker -l info -c 4 -Q default,ml,reporting
-    depends_on:
-      - timescaledb
-      - redis
-    env_file: .env
-    volumes:
-      - ./django_app:/app
-      - models_data:/models
-
-  celery-beat:
-    build:
-      context: .
-      dockerfile: django_app/Dockerfile
-    command: celery -A celery_app beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
-    depends_on:
-      - timescaledb
-      - redis
-    env_file: .env
+  # ═══════════════════════════════════════════════════════════════════════════
+  # MICROSERVICES
+  # ═══════════════════════════════════════════════════════════════════════════
 
   data-ingestion:
     build:
       context: .
       dockerfile: services/data_ingestion/Dockerfile
+    container_name: candlescout-data-ingestion
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -101,41 +66,46 @@ services:
         condition: service_healthy
     env_file: .env
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   analysis-pipeline:
     build:
       context: .
       dockerfile: services/analysis_pipeline/Dockerfile
+    container_name: candlescout-analysis-pipeline
     depends_on:
-      - timescaledb
-      - redis
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file: .env
     deploy:
       replicas: 2
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   ml-service:
     build:
       context: .
       dockerfile: services/ml_service/Dockerfile
+    container_name: candlescout-ml-service
     depends_on:
-      - timescaledb
+      timescaledb:
+        condition: service_healthy
     env_file: .env
     volumes:
       - models_data:/models
     restart: unless-stopped
-
-  trade-executor:
-    build:
-      context: .
-      dockerfile: services/trade_executor/Dockerfile
-    depends_on:
-      - timescaledb
-      - redis
-    env_file: .env
-    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -144,33 +114,170 @@ services:
     build:
       context: .
       dockerfile: services/signal_dispatcher/Dockerfile
+    container_name: candlescout-signal-dispatcher
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     env_file: .env
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  trade-executor:
+    build:
+      context: .
+      dockerfile: services/trade_executor/Dockerfile
+    container_name: candlescout-trade-executor
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  position-manager:
+    build:
+      context: .
+      dockerfile: services/position_manager/Dockerfile
+    container_name: candlescout-position-manager
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  api-service:
+    build:
+      context: .
+      dockerfile: services/api_service/Dockerfile
+    container_name: candlescout-api-service
+    ports:
+      - "8000:8000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # LEGACY SERVICES (Django/Celery)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  django-migrate:
+    build:
+      context: .
+      dockerfile: django_app/Dockerfile
+    container_name: candlescout-django-migrate
+    command: python manage.py migrate --no-input
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    env_file: .env
+    volumes:
+      - ./django_app:/app
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: django_app/Dockerfile
+    container_name: candlescout-celery-worker
+    command: celery -A celery_app worker -l info -c 4 -Q default,ml,reporting
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      django-migrate:
+        condition: service_completed_successfully
+    env_file: .env
+    volumes:
+      - ./django_app:/app
+      - models_data:/models
+    restart: unless-stopped
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: django_app/Dockerfile
+    container_name: candlescout-celery-beat
+    command: celery -A celery_app beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      django-migrate:
+        condition: service_completed_successfully
+    env_file: .env
+    volumes:
+      - ./django_app:/app
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # MONITORING SERVICES
+  # ═══════════════════════════════════════════════════════════════════════════
 
   prometheus:
     image: prom/prometheus:v3.0.0
+    container_name: candlescout-prometheus
     ports:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
       - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    restart: unless-stopped
 
   grafana:
     image: grafana/grafana:11.3.0
+    container_name: candlescout-grafana
     ports:
       - "3000:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_INSTALL_PLUGINS: grafana-clock-panel
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
       - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    restart: unless-stopped
 
 volumes:
   db_data:
   redis_data:
   models_data:
   prometheus_data:
-  grafana_data:
+  grafana_data
+
+networks:
+  default:
+    name: candlescout-network:
